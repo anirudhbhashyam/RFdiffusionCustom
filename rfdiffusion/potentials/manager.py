@@ -134,7 +134,12 @@ class PotentialManager:
         setting_dict = {entry.split(':')[0]:entry.split(':')[1] for entry in potstr.split(',')}
 
         for key in setting_dict:
-            if not key == 'type': setting_dict[key] = float(setting_dict[key])
+            if not key == 'type':
+                try:
+                    setting_dict[key] = float(setting_dict[key])
+                except ValueError:
+                    setting_dict[key] = setting_dict[key]
+
 
         return setting_dict
 
@@ -167,12 +172,16 @@ class PotentialManager:
 
         return to_apply
 
-    def compute_all_potentials(self, xyz):
+    def compute_all_potentials(self, xyz, diffusion_mask):
         '''
             This is the money call. Take the current sequence and structure information and get the sum of all of the potentials that are being used
         '''
 
-        potential_list = [potential.compute(xyz) for potential in self.potentials_to_apply]
+        potential_list = [potential.compute(xyz, diffusion_mask) for potential in self.potentials_to_apply]
+        
+        for p, val in zip(self.potentials_to_apply, potential_list, strict = True):
+            print(f"{p.__class__.__name__}: {val}")
+
         potential_stack = torch.stack(potential_list, dim=0)
 
         return torch.sum(potential_stack, dim=0)

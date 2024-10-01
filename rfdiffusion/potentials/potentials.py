@@ -1,13 +1,130 @@
 import torch
-import numpy as np 
+import numpy as np
+import rfdiffusion.util as util
 from rfdiffusion.util import generate_Cbeta
+
+### FROM inference.utils ###
+def parse_pdb(filename, **kwargs):
+    """extract xyz coords for all heavy atoms"""
+    with open(filename,"r") as f:
+        lines=f.readlines()
+    return parse_pdb_lines(lines, **kwargs)
+
+def parse_pdb_lines(lines, parse_hetatom=False, ignore_het_h=True):
+    # indices of residues observed in the structure
+    res, pdb_idx = [],[]
+    for l in lines:
+        if l[:4] == "ATOM" and l[12:16].strip() == "CA":
+            res.append((l[22:26], l[17:20]))
+            # chain letter, res num
+            pdb_idx.append((l[21:22].strip(), int(l[22:26].strip())))
+    seq = [util.aa2num[r[1]] if r[1] in util.aa2num.keys() else 20 for r in res]
+    pdb_idx = [
+        (l[21:22].strip(), int(l[22:26].strip()))
+        for l in lines
+        if l[:4] == "ATOM" and l[12:16].strip() == "CA"
+    ]  # chain letter, res num
+
+    # 4 BB + up to 10 SC atoms
+    xyz = np.full((len(res), 14, 3), np.nan, dtype=np.float32)
+    for l in lines:
+        if l[:4] != "ATOM":
+            continue
+        chain, resNo, atom, aa = (
+            l[21:22],
+            int(l[22:26]),
+            " " + l[12:16].strip().ljust(3),
+            l[17:20],
+        )
+        if (chain,resNo) in pdb_idx:
+            idx = pdb_idx.index((chain, resNo))
+            # for i_atm, tgtatm in enumerate(util.aa2long[util.aa2num[aa]]):
+            for i_atm, tgtatm in enumerate(
+                util.aa2long[util.aa2num[aa]][:14]
+                ):
+                if (
+                    tgtatm is not None and tgtatm.strip() == atom.strip()
+                    ):  # ignore whitespace
+                    xyz[idx, i_atm, :] = [float(l[30:38]), float(l[38:46]), float(l[46:54])]
+                    break
+
+    # save atom mask
+    mask = np.logical_not(np.isnan(xyz[..., 0]))
+    xyz[np.isnan(xyz[..., 0])] = 0.0
+
+    # remove duplicated (chain, resi)
+    new_idx = []
+    i_unique = []
+    for i, idx in enumerate(pdb_idx):
+        if idx not in new_idx:
+            new_idx.append(idx)
+            i_unique.append(i)
+
+    pdb_idx = new_idx
+    xyz = xyz[i_unique]
+    mask = mask[i_unique]
+
+    seq = np.array(seq)[i_unique]
+
+    out = {
+        "xyz": xyz,  # cartesian coordinates, [Lx14]
+        "mask": mask,  # mask showing which atoms are present in the PDB file, [Lx14]
+        "idx": np.array(
+            [i[1] for i in pdb_idx]
+        ),  # residue numbers in the PDB file, [L]
+        "seq": np.array(seq),  # amino acid sequence, [L]
+        "pdb_idx": pdb_idx,  # list of (chain letter, residue number) in the pdb file, [L]
+    }
+
+    # heteroatoms (ligands, etc)
+    if parse_hetatom:
+        xyz_het, info_het = [], []
+        for l in lines:
+            if l[:6] == "HETATM" and not (ignore_het_h and l[77] == "H"):
+                info_het.append(
+                    dict(
+                        idx=int(l[7:11]),
+                        atom_id=l[12:16],
+                        atom_type=l[77],
+                        name=l[16:20],
+                    )
+                )
+                xyz_het.append([float(l[30:38]), float(l[38:46]), float(l[46:54])])
+
+        out["xyz_het"] = np.array(xyz_het)
+        out["info_het"] = info_het
+
+    return out
+### FROM inference.utils ###
+
+def kabsch(p, q):
+    assert p.shape[0] == q.shape[0]
+    def _centroid(x):
+        return x.mean(0)
+
+    p_centroid = _centroid(p)
+    q_centroid = _centroid(q)
+
+    p_centered = p - p_centroid
+    q_centered = q - q_centroid
+
+    H = p_centered.T @ q_centered
+
+    U, _, Vt = torch.linalg.svd(H, full_matrices = False)
+
+    d = torch.sign(torch.linalg.det(U) * torch.linalg.det(Vt))
+
+    R = U @ torch.diag(torch.tensor([1, 1, d])) @ Vt
+    t = q_centroid - p_centroid @ R
+
+    return R, t
 
 class Potential:
     '''
         Interface class that defines the functions a potential must implement
     '''
 
-    def compute(self, xyz):
+    def compute(self, xyz, diffusion_mask):
         '''
             Given the current structure of the model prediction, return the current
             potential as a PyTorch tensor with a single entry
@@ -33,7 +150,7 @@ class monomer_ROG(Potential):
         self.weight   = weight
         self.min_dist = min_dist
 
-    def compute(self, xyz):
+    def compute(self, xyz, diffusion_mask):
         Ca = xyz[:,1] # [L,3]
 
         centroid = torch.mean(Ca, dim=0, keepdim=True) # [1,3]
@@ -45,6 +162,79 @@ class monomer_ROG(Potential):
         rad_of_gyration = torch.sqrt( torch.sum(torch.square(dgram)) / Ca.shape[0] ) # [1]
 
         return -1 * self.weight * rad_of_gyration
+    
+class AntibodyClash(Potential):
+    def __init__(self, pdb_filepath, reference_mask, clash_chains, weight = 1, sigma = 1e2, eps = 1e-2):
+        self.sigma = sigma
+        self.eps = eps
+        self.chains = clash_chains.split("-")
+        self.weight = weight
+        self.pdb = parse_pdb(pdb_filepath)
+        self.reference_mask = reference_mask
+
+        self.antibody_coord_indices = list(
+            self._get_antibody_residue_chain_indices()
+        )
+        self.reference_motif_coord_indices = list(
+            self._get_reference_motif_indices()
+        )
+        self.antibody_coords = torch.tensor(self.pdb["xyz"][self.antibody_coord_indices])
+        self.antibody_coords_ca = self.antibody_coords[:, -1]
+        self.reference_motif_coords = self.pdb["xyz"][self.reference_motif_coord_indices]
+        self.reference_motif_ca_xyz = torch.tensor(
+            self.reference_motif_coords[:, 1],
+        )
+
+    def compute(self, xyz, diffusion_mask):
+        ca_xyz = xyz[:, 1]
+        motif_ca_xyz = ca_xyz[diffusion_mask]
+
+        rotation, translation = kabsch(motif_ca_xyz.detach(), self.reference_motif_ca_xyz)
+
+        aligned_ca_xyz = ca_xyz @ rotation + translation
+
+        non_motif_ca_xyz = aligned_ca_xyz[~diffusion_mask]
+
+        pairwise_distances = torch.sqrt(
+            (
+                (
+                    non_motif_ca_xyz.view(1, *non_motif_ca_xyz.shape) 
+                    - self.antibody_coords_ca.view(self.antibody_coords_ca.shape[0], 1, -1)
+                ) ** 2
+            ).sum(-1)
+        )
+        # sigma_r_factor = self.sigma ** 6 / pairwise_distances ** 6
+        # v_lj = self.eps * sigma_r_factor * (sigma_r_factor - 1)
+        return self.weight * pairwise_distances.mean()
+
+    def _get_reference_motif_indices(self):
+        selectors = [
+            (c, range(s, e + 1))
+            for c, s, e
+            in self._get_selector_from_mask(self.reference_mask)
+        ]
+        for i, chain, res_id in self._pdb_iter():
+            for c, rng in selectors:
+                if chain == c and res_id in rng:
+                    yield i
+
+    def _get_selector_from_mask(self, mask):
+        for selector in mask.split("/"):
+            if selector[0].isalpha():
+                start, end = selector[1 :].split("-")
+                yield selector[0], int(start), int(end)
+
+    def _get_antibody_residue_chain_indices(self):
+        idx = []
+        for i, chain, _ in self._pdb_iter():
+            if chain in self.chains:
+                yield i
+
+    def _pdb_iter(self):
+        yield from (
+            (i, chain, res_id)
+            for i, (chain, res_id) in enumerate(self.pdb["pdb_idx"])
+        )
 
 class binder_ROG(Potential):
     '''
@@ -464,7 +654,9 @@ implemented_potentials = { 'monomer_ROG':          monomer_ROG,
                            'interface_ncontacts':  interface_ncontacts,
                            'monomer_contacts':     monomer_contacts,
                            'olig_contacts':        olig_contacts,
-                           'substrate_contacts':    substrate_contacts}
+                           'substrate_contacts':   substrate_contacts,
+                           "antibody_clash":       AntibodyClash,
+}
 
 require_binderlen      = { 'binder_ROG',
                            'binder_distance_ReLU',
@@ -472,4 +664,3 @@ require_binderlen      = { 'binder_ROG',
                            'dimer_ROG',
                            'binder_ncontacts',
                            'interface_ncontacts'}
-
