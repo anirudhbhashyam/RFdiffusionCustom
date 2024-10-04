@@ -386,7 +386,7 @@ class Denoise:
         if not xyz.grad is None:
             xyz.grad.zero_()
 
-        current_potential = self.potential_manager.compute_all_potentials(xyz)
+        current_potential = self.potential_manager.compute_all_potentials(xyz, diffusion_mask)
         current_potential.backward()
 
         # Since we are not moving frames, Cb grads are same as Ca grads
