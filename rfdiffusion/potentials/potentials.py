@@ -164,13 +164,26 @@ class monomer_ROG(Potential):
         return -1 * self.weight * rad_of_gyration
     
 class AntibodyClash(Potential):
-    def __init__(self, pdb_filepath, reference_mask, clash_chains, weight = 1, sigma = 1e2, eps = 1e-2):
+    def __init__(
+        self,
+        pdb_filepath,
+        reference_mask,
+        clash_chains,
+        components_from_diffusion_mask_for_motif: str,
+        weight = 1,
+        sigma = 1e2,
+        eps = 1e-2, 
+    ):
         self.sigma = sigma
         self.eps = eps
         self.chains = clash_chains.split("-")
         self.weight = weight
         self.pdb = parse_pdb(pdb_filepath)
         self.reference_mask = reference_mask
+        self.components_from_diffusion_mask_for_motif = set(
+            int(x)
+            for x in components_from_diffusion_mask_for_motif.split("-")
+        )
 
         self.antibody_coord_indices = list(
             self._get_antibody_residue_chain_indices()
@@ -186,13 +199,24 @@ class AntibodyClash(Potential):
         )
 
     def compute(self, xyz, diffusion_mask):
+        fixed_residue_indices = torch.where(diffusion_mask)[0]
+        fixed_residue_indices_split = torch.tensor_split(
+            fixed_residue_indices,
+            torch.where(fixed_residue_indices[1 :] != fixed_residue_indices[: -1] + 1)[0] + 1,
+        )
+        designed_motif_indices = torch.hstack(
+            [
+                idx_rng 
+                for i, idx_rng in enumerate(fixed_residue_indices_split)
+                if i in self.components_from_diffusion_mask_for_motif
+            ]
+        )
+        
         ca_xyz = xyz[:, 1]
-        motif_ca_xyz = ca_xyz[diffusion_mask]
+        motif_ca_xyz = ca_xyz[designed_motif_indices]
 
         rotation, translation = kabsch(motif_ca_xyz.detach(), self.reference_motif_ca_xyz)
-
         aligned_ca_xyz = ca_xyz @ rotation + translation
-
         non_motif_ca_xyz = aligned_ca_xyz[~diffusion_mask]
 
         pairwise_distances = torch.sqrt(
